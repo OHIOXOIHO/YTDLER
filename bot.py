@@ -4,6 +4,7 @@ import time
 import asyncio
 from functools import wraps
 import re
+import subprocess
 
 from pyrogram import Client, filters
 from pyrogram.enums import ChatType, ChatMemberStatus
@@ -50,6 +51,52 @@ active_downloads = {}
 last_update_time = {}
 
 # --- HELPER FUNCTIONS --- #
+
+def get_video_metadata(file_path):
+    """
+    Uses ffprobe to get accurate video metadata if yt-dlp fails to provide it.
+    Requires ffmpeg to be installed on the system.
+    """
+    try:
+        command = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,duration",
+            "-of", "csv=p=0:s=x"
+        ]
+        process = subprocess.run(command + [file_path], capture_output=True, text=True, check=True)
+        # Expected output: "1280x720x15.345"
+        output = process.stdout.strip().split('x')
+        if len(output) == 3:
+            width = int(output[0])
+            height = int(output[1])
+            duration = int(float(output[2]))
+            return {"width": width, "height": height, "duration": duration}
+    except (subprocess.CalledProcessError, FileNotFoundError, IndexError, ValueError) as e:
+        print(f"Could not get metadata using ffprobe for {file_path}: {e}")
+    return None
+
+def generate_thumbnail(video_path):
+    """
+    Generates a thumbnail from the video file using ffmpeg.
+    """
+    thumbnail_path = f"{os.path.splitext(video_path)[0]}.jpg"
+    try:
+        command = [
+            "ffmpeg",
+            "-i", video_path,
+            "-ss", "00:00:01.00", # Capture frame at 1 second
+            "-vframes", "1",
+            "-y", # Overwrite output file if it exists
+            thumbnail_path
+        ]
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if os.path.exists(thumbnail_path):
+            return thumbnail_path
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"Could not generate thumbnail for {video_path}: {e}")
+    return None
 
 def load_json(file_path):
     """خواندن دیتا از یک فایل JSON."""
@@ -107,7 +154,7 @@ def set_chat_settings(chat_id, quality):
     settings[str(chat_id)] = quality
     save_json(settings, SETTINGS_FILE)
 
-async def progress_hook(d, message: Message, chat_id: int):
+async def progress_hook(d, message: Message, chat_id: int, playlist_progress=""):
     """هوک برای نمایش و به‌روزرسانی نوار پیشرفت دانلود."""
     if chat_id in active_downloads and active_downloads[chat_id]['cancelled']:
         raise Exception("Download cancelled.")
@@ -123,7 +170,9 @@ async def progress_hook(d, message: Message, chat_id: int):
                 last_update_time[chat_id] = current_time
                 
                 progress_bar = "".join(["█" if i < percentage / 5 else "░" for i in range(20)])
+                playlist_header = f"{playlist_progress}\n" if playlist_progress else ""
                 status_text = (
+                    f"{playlist_header}"
                     f"📥 **در حال دانلود...**\n"
                     f"`{progress_bar}`\n"
                     f"**پیشرفت:** {percentage:.1f}%\n"
@@ -137,7 +186,7 @@ async def progress_hook(d, message: Message, chat_id: int):
                 except Exception:
                     pass
 
-async def upload_progress(current, total, message: Message, chat_id: int):
+async def upload_progress(current, total, message: Message, chat_id: int, playlist_progress=""):
     """تابع نمایش نوار پیشرفت آپلود."""
     if chat_id in active_downloads and active_downloads[chat_id]['cancelled']:
         raise Exception("Upload cancelled.")
@@ -148,7 +197,9 @@ async def upload_progress(current, total, message: Message, chat_id: int):
         
         percentage = (current / total) * 100
         progress_bar = "".join(["█" if i < percentage / 5 else "░" for i in range(20)])
+        playlist_header = f"{playlist_progress}\n" if playlist_progress else ""
         status_text = (
+            f"{playlist_header}"
             f"📤 **در حال آپلود...**\n"
             f"`{progress_bar}`\n"
             f"**پیشرفت:** {percentage:.1f}%\n"
@@ -261,7 +312,6 @@ async def handle_link(client, message: Message):
     url = url_match.group(0)
     chat_id = message.chat.id
 
-    # --- Immediate and Silent Logging of the request ---
     try:
         user = message.from_user
         log_text = (
@@ -274,27 +324,32 @@ async def handle_link(client, message: Message):
         )
         await client.send_message(LOG_CHANNEL_ID, log_text, disable_web_page_preview=True)
     except Exception as initial_log_e:
-        print(f"!!! [NON-FATAL] Could not send initial text log to archive channel: {initial_log_e}")
+        print(f"!!! [NON-FATAL] Could not send initial text log: {initial_log_e}")
 
     status_msg = await message.reply_text("🔎 در حال پردازش لینک، لطفا صبر کنید...")
 
-    # --- Caching Logic ---
     link_db = load_json(LINK_DB_FILE)
     if url in link_db:
         message_id_in_log_channel = link_db[url]
         try:
-            await status_msg.edit_text("✅ لینک در آرشیو یافت شد. در حال ارسال...")
             await client.copy_message(
                 chat_id=chat_id,
                 from_chat_id=LOG_CHANNEL_ID,
                 message_id=message_id_in_log_channel
             )
             await status_msg.delete()
-            return
+            return # --- Mission Accomplished ---
         except Exception as e:
-            await status_msg.edit_text(f"⚠️ ارسال از آرشیو ناموفق بود. دانلود مجدد... \nخطا: {e}")
+            if "empty message" in str(e).lower() or "message_id_invalid" in str(e).lower():
+                print(f"Archived message for {url} deleted. Re-downloading.")
+                del link_db[url]
+                save_json(link_db, LINK_DB_FILE)
+                # --- Let the code fall through to the download section ---
+            else:
+                await status_msg.edit_text(f"⚠️ ارسال از آرشیو ناموفق بود.\nخطا: {e}")
+                return
     
-    if chat_id in active_downloads and not active_downloads[chat_id]['done']:
+    if chat_id in active_downloads and not active_downloads[chat_id].get('done', True):
         return await status_msg.edit_text("یک دانلود دیگر در این چت در حال انجام است. لطفا صبر کنید.")
 
     try:
@@ -338,17 +393,17 @@ async def handle_link(client, message: Message):
             await status_msg.edit_text(f"خطایی رخ داد: {error_message}")
 
 
-async def download_and_upload_video(client, message, url, status_msg=None):
+async def download_and_upload_video(client, message, url, status_msg=None, playlist_progress=""):
     """تابع برای دانلود، آپلود، و ذخیره ویدیو در آرشیو."""
     chat_id = message.chat.id
     
     if not status_msg:
         status_msg = await message.reply_text("در حال آماده‌سازی برای دانلود...")
     else:
-        await status_msg.edit_text("در حال آماده‌سازی برای دانلود...")
+        await status_msg.edit_text(f"{playlist_progress}\nدر حال آماده‌سازی برای دانلود..." if playlist_progress else "در حال آماده‌سازی برای دانلود...")
 
     active_downloads[chat_id] = {'cancelled': False, 'done': False}
-    file_path, thumbnail_path = None, None
+    file_path = None
     
     try:
         quality = get_chat_settings(chat_id)
@@ -357,7 +412,7 @@ async def download_and_upload_video(client, message, url, status_msg=None):
         ydl_opts = {
             'format': format_str,
             'outtmpl': os.path.join(DOWNLOAD_DIR, '%(id)s.%(ext)s'),
-            'progress_hooks': [lambda d: asyncio.ensure_future(progress_hook(d, status_msg, chat_id))],
+            'progress_hooks': [lambda d: asyncio.ensure_future(progress_hook(d, status_msg, chat_id, playlist_progress=playlist_progress))],
             'noplaylist': True,
             'merge_output_format': 'mp4',
             'writethumbnail': True,
@@ -378,15 +433,32 @@ async def download_and_upload_video(client, message, url, status_msg=None):
         duration = int(info.get('duration') or 0)
         width = int(info.get('width') or 0)
         height = int(info.get('height') or 0)
-        
+        thumbnail_path = None
+
+        if not duration or not width:
+            print("Metadata from yt-dlp is incomplete. Falling back to ffprobe...")
+            metadata = get_video_metadata(file_path)
+            if metadata:
+                print(f"ffprobe metadata found: {metadata}")
+                duration = metadata['duration']
+                width = metadata['width']
+                height = metadata['height']
+
         base_filename = os.path.splitext(file_path)[0]
         for ext in ['webp', 'jpg', 'png', 'jpeg']:
              potential_thumb = f"{base_filename}.{ext}"
              if os.path.exists(potential_thumb):
                  thumbnail_path = potential_thumb
                  break
+        
+        if not thumbnail_path:
+            print("No thumbnail found. Falling back to ffmpeg to generate one...")
+            thumbnail_path = generate_thumbnail(file_path)
+            if thumbnail_path:
+                print(f"ffmpeg thumbnail generated at: {thumbnail_path}")
 
-        await status_msg.edit_text("فایل دانلود شد. در حال آپلود و آرشیو...")
+        upload_caption = f"{playlist_progress}\nفایل دانلود شد. در حال آپلود و آرشیو..." if playlist_progress else "فایل دانلود شد. در حال آپلود و آرشیو..."
+        await status_msg.edit_text(upload_caption)
         
         log_message = await client.send_video(
             chat_id=LOG_CHANNEL_ID,
@@ -398,7 +470,7 @@ async def download_and_upload_video(client, message, url, status_msg=None):
             width=width,
             height=height,
             progress=upload_progress,
-            progress_args=(status_msg, chat_id)
+            progress_args=(status_msg, chat_id, playlist_progress)
         )
 
         link_db = load_json(LINK_DB_FILE)
@@ -412,40 +484,52 @@ async def download_and_upload_video(client, message, url, status_msg=None):
             f"🆔 **آیدی:** `{user.id}`"
         )
         await client.send_message(LOG_CHANNEL_ID, log_text, reply_to_message_id=log_message.id)
-
-        await status_msg.edit_text("✅ آرشیو شد. در حال ارسال...")
-
-        await client.copy_message(
-            chat_id=chat_id,
-            from_chat_id=LOG_CHANNEL_ID,
-            message_id=log_message.id
-        )
         
-        await status_msg.delete()
+        if not playlist_progress:
+            await client.copy_message(
+                chat_id=chat_id,
+                from_chat_id=LOG_CHANNEL_ID,
+                message_id=log_message.id
+            )
+            await status_msg.delete()
+        else:
+            await client.copy_message(
+                chat_id=chat_id,
+                from_chat_id=LOG_CHANNEL_ID,
+                message_id=log_message.id
+            )
 
     except Exception as e:
         error_message = str(e)
+        final_error_message = f"عملیات ناموفق بود: {error_message}"
         if "Sign in to confirm" in error_message or "Private video" in error_message or "age-restricted" in error_message:
-            await status_msg.edit_text(
+            final_error_message = (
                 "**خطای احراز هویت!**\n\n"
-                "این ویدیو نیازمند لاگین است (خصوصی، محدودیت سنی و ...).\n"
-                "برای حل مشکل، لطفاً یک فایل `cookies.txt` جدید و معتبر از مرورگر خود استخراج کرده و در کنار ربات قرار دهید."
+                "این ویدیو نیازمند لاگین است.\n"
+                "برای حل مشکل، لطفاً یک فایل `cookies.txt` جدید و معتبر ارائه دهید."
             )
-        else:
+        
+        if not playlist_progress:
             try:
-                await status_msg.edit_text(f"عملیات ناموفق بود: {error_message}")
+                await status_msg.edit_text(final_error_message)
             except Exception:
                 pass
-        print(f"!!! [FATAL ERROR] Operation failed: {e}")
+        
+        raise e
         
     finally:
         active_downloads[chat_id]['done'] = True
-        if chat_id in last_update_time:
-            del last_update_time[chat_id]
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
-        if thumbnail_path and os.path.exists(thumbnail_path):
-            os.remove(thumbnail_path)
+        if not playlist_progress:
+             if chat_id in last_update_time:
+                del last_update_time[chat_id]
+        if file_path:
+            base_path = os.path.splitext(file_path)[0]
+            for ext in ['.mp4', '.mkv', '.part', '.webp', '.jpg', '.png', '.jpeg']:
+                file_to_remove = f"{base_path}{ext}"
+                if os.path.exists(file_to_remove):
+                    try:
+                        os.remove(file_to_remove)
+                    except OSError: pass
 
 
 # --- CALLBACK QUERY HANDLERS --- #
@@ -478,47 +562,85 @@ async def cancel_download_callback(client, callback_query: CallbackQuery):
 
 @app.on_callback_query(filters.regex(r"^download_playlist_"))
 async def playlist_callback(client, callback_query: CallbackQuery):
-    action = callback_query.data.split("_")[-1]
     chat_id = callback_query.message.chat.id
+    
+    if chat_id not in active_downloads or 'original_message' not in active_downloads[chat_id]:
+         await callback_query.answer("اطلاعات اصلی درخواست یافت نشد. لطفا دوباره تلاش کنید.", show_alert=True)
+         try:
+            await callback_query.message.delete()
+         except Exception: pass
+         return
+         
+    original_user_message = active_downloads[chat_id]['original_message']
     
     await callback_query.message.delete()
     
+    action = callback_query.data.split("_")[-1]
+
     if action == "no":
         if chat_id in active_downloads:
             del active_downloads[chat_id]
         return
 
     if action == "yes":
-        if chat_id not in active_downloads or 'playlist_info' not in active_downloads[chat_id]:
-            return await client.send_message(chat_id, "اطلاعات پلی‌لیست یافت نشد. لطفا دوباره تلاش کنید.")
-
         playlist_info = active_downloads[chat_id]['playlist_info']
-        original_user_message = active_downloads[chat_id]['original_message']
-
-        await original_user_message.reply_text(f"شروع پردازش {len(playlist_info['entries'])} ویدیو...")
+        playlist_count = len(playlist_info['entries'])
+        status_msg = await original_user_message.reply_text(f"شروع پردازش {playlist_count} ویدیو...")
         
         link_db = load_json(LINK_DB_FILE)
+        success_count = 0
+        fail_count = 0
         for i, entry in enumerate(playlist_info['entries']):
-            video_url = entry['url']
+            video_url = entry.get('url')
+            if not video_url: 
+                fail_count += 1
+                continue
+
             if active_downloads.get(chat_id, {}).get('cancelled'):
-                await original_user_message.reply_text("عملیات پلی‌لیست توسط کاربر لغو شد.")
+                await status_msg.edit_text(f"عملیات پلی‌لیست توسط کاربر لغو شد.\n{success_count} ویدیو با موفقیت ارسال شد.")
+                await asyncio.sleep(5)
                 break
             
+            progress_str = f"**پلی‌لیست: {i+1}/{playlist_count}**"
+            
+            cache_hit = False
             if video_url in link_db:
-                status_msg = await original_user_message.reply_text(f"✅ ویدیو {i+1} در آرشیو یافت شد...")
-                await client.copy_message(chat_id, LOG_CHANNEL_ID, link_db[video_url])
-                await status_msg.delete()
-                await asyncio.sleep(1) # to avoid flood waits
+                try:
+                    await status_msg.edit_text(f"{progress_str}\nدر حال ارسال ویدیو...")
+                    await client.copy_message(chat_id, LOG_CHANNEL_ID, link_db[video_url])
+                    success_count += 1
+                    cache_hit = True
+                except Exception as e:
+                    if "empty message" in str(e).lower() or "message_id_invalid" in str(e).lower():
+                        print(f"Archived playlist item for {video_url} was deleted. Re-downloading.")
+                        del link_db[video_url]
+                        save_json(link_db, LINK_DB_FILE)
+                    else:
+                        fail_count += 1
+                        title = entry.get('title', 'N/A')
+                        await status_msg.edit_text(f"{progress_str}\n❌ ارسال ویدیو `{title}` از آرشیو ناموفق بود.")
+                        print(f"Failed to copy playlist item '{title}' from archive: {e}")
+                        await asyncio.sleep(3)
+                        continue
+            
+            if cache_hit:
+                await asyncio.sleep(1)
                 continue
-
-            status_message_playlist = await original_user_message.reply_text(f"⏳ دانلود ویدیو {i+1}: `{entry.get('title', 'N/A')}`")
+            
             try:
-                await download_and_upload_video(client, original_user_message, video_url, status_message_playlist)
+                await download_and_upload_video(client, original_user_message, video_url, status_msg, playlist_progress=progress_str)
+                success_count += 1
             except Exception as e:
-                await original_user_message.reply_text(f"❌ دانلود ویدیو `{entry.get('title', 'N/A')}` ناموفق بود: {e}")
+                fail_count += 1
+                title = entry.get('title', 'N/A')
+                await status_msg.edit_text(f"{progress_str}\n❌ دانلود ویدیو `{title}` ناموفق بود.")
+                print(f"Failed to process playlist item '{title}': {e}")
+                await asyncio.sleep(3)
                 continue
 
-        await original_user_message.reply_text("✅ تمام ویدیوهای پلی‌لیست پردازش شدند.")
+        await status_msg.edit_text(f"✅ پردازش پلی‌لیست تمام شد.\nموفق: {success_count} | ناموفق: {fail_count}")
+        await asyncio.sleep(5)
+        await status_msg.delete()
         
     if chat_id in active_downloads:
         del active_downloads[chat_id]
